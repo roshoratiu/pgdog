@@ -411,6 +411,36 @@ impl Parameters {
             .collect()
     }
 
+    /// Generate the *minimal* set of queries to turn the `current` server-side
+    /// session state into `self` (the desired client state).
+    ///
+    /// Only params that actually differ are touched: a param present on the
+    /// server but not wanted by the client is `RESET`, and a param whose value
+    /// differs (or is missing) is `SET`. Params that already match are skipped.
+    ///
+    /// This avoids the reset-everything-then-set-everything churn that happens
+    /// when only a single param (e.g. `application_name`) differs between two
+    /// clients sharing a pooled connection.
+    pub fn diff_queries(&self, current: &Self) -> Vec<Query> {
+        let mut queries = Vec::new();
+
+        // RESET params the server has but the client no longer wants.
+        for name in current.params.keys() {
+            if !self.params.contains_key(name) {
+                queries.push(Query::new(format!(r#"RESET "{}""#, name)));
+            }
+        }
+
+        // SET params whose desired value differs from what's on the server.
+        for (name, value) in &self.params {
+            if current.params.get(name) != Some(value) {
+                queries.push(Query::new(format!(r#"SET "{}" TO {}"#, name, value)));
+            }
+        }
+
+        queries
+    }
+
     /// Get parameter value or returned an error.
     pub fn get_required(&self, name: &str) -> Result<&str, Error> {
         self.get(name)
@@ -980,6 +1010,44 @@ mod test {
 
         // After reset, local params should also be cleared
         assert_eq!(params.get("search_path"), None);
+    }
+
+    #[test]
+    fn test_diff_queries_only_touches_changes() {
+        // Server currently has these params set.
+        let mut current = Parameters::default();
+        current.insert("application_name", "bin/rails");
+        current.insert("timezone", "UTC");
+        current.insert("statement_timeout", "14s");
+
+        // Desired client state differs only in application_name.
+        let mut desired = Parameters::default();
+        desired.insert("application_name", "sidekiq");
+        desired.insert("timezone", "UTC");
+        desired.insert("statement_timeout", "14s");
+
+        let queries: Vec<String> = desired
+            .diff_queries(&current)
+            .iter()
+            .map(|q| q.query().to_string())
+            .collect();
+
+        // Only the one differing param is synced; identical params are skipped.
+        assert_eq!(queries, vec![r#"SET "application_name" TO "sidekiq""#]);
+
+        // Identical states produce no queries at all.
+        assert!(desired.diff_queries(&desired).is_empty());
+
+        // A param on the server but no longer wanted is RESET.
+        let mut dropped = Parameters::default();
+        dropped.insert("timezone", "UTC");
+        dropped.insert("statement_timeout", "14s");
+        let reset: Vec<String> = dropped
+            .diff_queries(&current)
+            .iter()
+            .map(|q| q.query().to_string())
+            .collect();
+        assert!(reset.contains(&r#"RESET "application_name""#.to_string()));
     }
 
     #[test]

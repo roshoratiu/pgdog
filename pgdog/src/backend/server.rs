@@ -602,15 +602,16 @@ impl Server {
 
         // Compare client and server params.
         let mut executed = if !params.identical(&self.client_params) {
-            // Construct client parameter SET queries.
+            // Construct the desired client parameter set.
             let tracked = params.tracked();
-            // Construct RESET queries to reset any current params
-            // to their default values.
-            let mut queries = self.client_params.reset_queries();
 
-            // Combine both to create a new, fresh session state
-            // on this connection.
-            queries.extend(tracked.set_queries(false));
+            // Only sync the params that actually differ from the server's
+            // current state, instead of resetting everything then setting it
+            // all back. When two clients differ in just one param (commonly
+            // `application_name` between Puma and Sidekiq sharing a pooled
+            // connection), this is a single SET rather than a full reset/set
+            // batch of every tracked param.
+            let queries = tracked.diff_queries(&self.client_params);
 
             // Set state on the connection only if
             // there are any params to change.
